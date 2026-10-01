@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -6,8 +6,16 @@ import streamlit as st
 from supabase import create_client
 
 TABLE = "tempering_log"
+CHECKS_TABLE = "rotameter_checks"
 TZ = ZoneInfo("Asia/Kolkata")
 MIN_TEMPERING_HOURS = 10  # milling shouldn't normally start before this many hours
+SECONDS_IN_READING = 30   # the rotameter check window
+
+SHIFT_WINDOWS = {
+    # shift: (start_time, start_day_offset, end_time, end_day_offset)
+    "A": (dtime(8, 0), 0, dtime(20, 0), 0),
+    "B": (dtime(20, 0), 0, dtime(8, 0), 1),
+}
 
 DISPLAY_COLUMNS = {
     "bin_no": "Bin No",
@@ -20,6 +28,14 @@ DISPLAY_COLUMNS = {
     "water_lph": "Water in lph",
     "blend": "Blend",
     "status": "Status",
+}
+
+CHECK_DISPLAY_COLUMNS = {
+    "bin_no": "Bin No",
+    "checked_at": "Checked at",
+    "water_in_30s": "Water in 30 secs",
+    "water_per_hour": "Water per hour",
+    "error_value": "Error value",
 }
 
 st.set_page_config(page_title="Tempering & Milling Log", layout="centered")
@@ -39,7 +55,9 @@ def get_client():
 
 
 def datetime_input(label: str, key: str) -> datetime:
-    """Date and time pickers side by side, returned as one timezone-aware datetime."""
+    """Date and time pickers side by side, returned as one timezone-aware datetime.
+    If session_state already holds a value for this key (e.g. pre-filled from a
+    Shift selection), that value wins over the 'now' default."""
     now = datetime.now(TZ).replace(second=0, microsecond=0)
     col_date, col_time = st.columns(2)
     d = col_date.date_input(f"{label} (date)", value=now.date(), key=f"{key}_d", format="DD/MM/YYYY")
@@ -47,7 +65,25 @@ def datetime_input(label: str, key: str) -> datetime:
     return datetime.combine(d, t, tzinfo=TZ)
 
 
-def fmt_duration(minutes: int) -> str:
+def apply_shift_defaults(shift: str):
+    """Pre-fill the tempering start/end pickers to match the chosen shift's
+    window, only when the shift selection actually changes."""
+    if st.session_state.get("_last_shift") == shift:
+        return
+    st.session_state["_last_shift"] = shift
+    if shift in SHIFT_WINDOWS:
+        start_t, start_off, end_t, end_off = SHIFT_WINDOWS[shift]
+        today = datetime.now(TZ).date()
+        st.session_state["ts_d"] = today + timedelta(days=start_off)
+        st.session_state["ts_t"] = start_t
+        st.session_state["te_d"] = today + timedelta(days=end_off)
+        st.session_state["te_t"] = end_t
+
+
+def fmt_duration(minutes) -> str:
+    if minutes is None:
+        return "—"
+    minutes = int(minutes)
     return f"{minutes // 60} h {minutes % 60:02d} min"
 
 
@@ -58,9 +94,10 @@ def fmt_ts(iso_value) -> str:
 
 
 def fetch_pending_bins() -> list[dict]:
-    """Bins that finished tempering but have no milling times logged yet."""
+    """Bins that finished tempering but have no milling times logged yet.
+    Also used to populate the Rotameter calibration tab's bin picker."""
     return (
-        get_client().table(TABLE).select("id,bin_no,temp_start,temp_end")
+        get_client().table(TABLE).select("id,bin_no,temp_start,water_lph")
         .is_("milling_start", "null").order("id").execute().data
     )
 
@@ -84,35 +121,61 @@ def fetch_all() -> list[dict]:
         start += 1000
 
 
+def fetch_recent_checks(n: int = 10) -> list[dict]:
+    return (
+        get_client().table(CHECKS_TABLE).select("*, tempering_log(bin_no)")
+        .order("id", desc=True).limit(n).execute().data
+    )
+
+
 def to_table(rows: list[dict]) -> pd.DataFrame:
     """Turn database rows into a display table, times shown in IST."""
     out = []
     for r in rows:
         out.append({
             "bin_no": r["bin_no"],
-            "shift": r.get("shift", "—"),
+            "shift": r.get("shift") or "—",
             "temp_start": fmt_ts(r["temp_start"]),
             "temp_end": fmt_ts(r["temp_end"]),
             "milling_start": fmt_ts(r.get("milling_start")),
             "milling_end": fmt_ts(r.get("milling_end")),
-            "total_tempering_minutes": fmt_duration(r["total_tempering_minutes"]),
-            "water_lph": r["water_lph"],
+            "total_tempering_minutes": fmt_duration(r.get("total_tempering_minutes")),
+            "water_lph": r.get("water_lph"),
             "blend": r["blend"],
             "status": "Complete" if r.get("milling_start") else "Awaiting milling",
         })
     return pd.DataFrame(out)[list(DISPLAY_COLUMNS)].rename(columns=DISPLAY_COLUMNS)
 
 
+def checks_to_table(rows: list[dict]) -> pd.DataFrame:
+    out = []
+    for r in rows:
+        linked = r.get("tempering_log") or {}
+        out.append({
+            "bin_no": linked.get("bin_no", "—"),
+            "checked_at": fmt_ts(r.get("checked_at")),
+            "water_in_30s": r.get("water_in_30s"),
+            "water_per_hour": r.get("water_per_hour"),
+            "error_value": r.get("error_value"),
+        })
+    return pd.DataFrame(out)[list(CHECK_DISPLAY_COLUMNS)].rename(columns=CHECK_DISPLAY_COLUMNS)
+
+
 st.title("Tempering & milling log")
 
-tab_temper, tab_mill = st.tabs(["① Start tempering", "② Start milling"])
+tab_temper, tab_mill, tab_rota = st.tabs(
+    ["① Start tempering", "② Start milling", "③ Rotameter calibration"]
+)
 
 # ---------------------------------------------------------------- tempering
 with tab_temper:
     st.caption("Log a bin as soon as tempering begins and ends. Milling is logged later, separately.")
+
+    bin_no = st.selectbox("Bin No", ["Select", "6", "7", "8"])
+    shift = st.selectbox("Shift", ["Select", "A", "B"])
+    apply_shift_defaults(shift)
+
     with st.form("temper_entry", clear_on_submit=True):
-        bin_no = st.selectbox("Bin No", ["Select", "6", "7", "8"])
-        shift = st.selectbox("Shift", ["Select", "A", "B"])
         blend = st.selectbox("Blend", ["Select", "Select Sbt", "MP"])
         water = st.number_input("Water in lph", min_value=0.0, step=1.0, format="%.1f")
 
@@ -136,18 +199,16 @@ with tab_temper:
             for e in errors:
                 st.error(e)
         else:
-            minutes = int((temp_end - temp_start).total_seconds() // 60)
             try:
                 get_client().table(TABLE).insert({
                     "bin_no": bin_no,
                     "shift": shift,
                     "temp_start": temp_start.isoformat(),
                     "temp_end": temp_end.isoformat(),
-                    "total_tempering_minutes": minutes,
                     "water_lph": water,
                     "blend": blend,
                 }).execute()
-                st.success(f"Tempering entry saved. Total tempering time: {fmt_duration(minutes)}.")
+                st.success("Tempering entry saved. Total tempering time will show once milling starts.")
             except Exception as exc:
                 st.error(f"Not saved: {exc}")
 
@@ -164,7 +225,7 @@ with tab_mill:
         st.info("No bins are currently waiting for milling.")
     else:
         options = {
-            r["id"]: f"Bin {r['bin_no']} — tempering ended {fmt_ts(r['temp_end'])}"
+            r["id"]: f"Bin {r['bin_no']} — tempering started {fmt_ts(r['temp_start'])}"
             for r in pending
         }
         pending_by_id = {r["id"]: r for r in pending}
@@ -193,14 +254,79 @@ with tab_mill:
                 for e in errors:
                     st.error(e)
             else:
+                total_minutes = int((mill_start - temp_start_dt).total_seconds() // 60)
                 try:
                     get_client().table(TABLE).update({
                         "milling_start": mill_start.isoformat(),
                         "milling_end": mill_end.isoformat(),
+                        "total_tempering_minutes": total_minutes,
                     }).eq("id", chosen_id).execute()
-                    st.success(f"Milling entry saved for {options[chosen_id]}.")
+                    st.success(
+                        f"Milling entry saved for {options[chosen_id]}. "
+                        f"Total tempering time: {fmt_duration(total_minutes)}."
+                    )
                 except Exception as exc:
                     st.error(f"Not saved: {exc}")
+
+# ------------------------------------------------------------- rotameter check
+with tab_rota:
+    st.caption(
+        "Optional: check the actual water flow against the Water in lph value "
+        "set for a bin while it's tempering."
+    )
+    try:
+        checkable = fetch_pending_bins()
+    except Exception as exc:
+        checkable = []
+        st.error(f"Could not load bins: {exc}")
+
+    if not checkable:
+        st.info("No bins are currently tempering.")
+    else:
+        rota_options = {
+            r["id"]: f"Bin {r['bin_no']} — tempering started {fmt_ts(r['temp_start'])}"
+            for r in checkable
+        }
+        rota_by_id = {r["id"]: r for r in checkable}
+
+        with st.form("rota_check", clear_on_submit=True):
+            rota_id = st.selectbox(
+                "Bin to check", list(rota_options.keys()), format_func=lambda i: rota_options[i]
+            )
+            water_30s = st.number_input(
+                "Water in 30 secs", min_value=0.0, step=0.1, format="%.2f"
+            )
+            submitted_rota = st.form_submit_button(
+                "Save calibration check", type="primary", use_container_width=True
+            )
+
+        if submitted_rota:
+            target_lph = rota_by_id[rota_id].get("water_lph")
+            water_per_hour = water_30s * (3600 / SECONDS_IN_READING)
+            error_value = (target_lph or 0) - water_per_hour
+            try:
+                get_client().table(CHECKS_TABLE).insert({
+                    "tempering_id": rota_id,
+                    "water_in_30s": water_30s,
+                    "water_per_hour": water_per_hour,
+                    "error_value": error_value,
+                }).execute()
+                st.success(
+                    f"Saved. Water per hour: {water_per_hour:.1f} lph — "
+                    f"Error value: {error_value:+.1f} lph (target was {target_lph})."
+                )
+            except Exception as exc:
+                st.error(f"Not saved: {exc}")
+
+    st.subheader("Recent calibration checks")
+    try:
+        recent_checks = fetch_recent_checks(10)
+        if recent_checks:
+            st.dataframe(checks_to_table(recent_checks), hide_index=True, use_container_width=True)
+        else:
+            st.info("No calibration checks logged yet.")
+    except Exception as exc:
+        st.error(f"Could not load calibration checks: {exc}")
 
 # ------------------------------------------------------------------ history
 st.subheader("Latest entries")
