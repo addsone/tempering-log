@@ -7,6 +7,16 @@ from supabase import create_client
 
 TABLE = "tempering_log"
 CHECKS_TABLE = "rotameter_checks"
+BLEND_RATIO_TABLE = "blend_ratio_checks"
+BLEND_VARIETIES = {
+    "MP": ["SBT", "AMR", "LOK", "RAJ", "MQ"],
+    "Select Sbt": ["Select Sbt", "SBT"],
+}
+TARGET_RATIOS = {
+    "MP": {"SBT": 16, "AMR": 15, "LOK": 19, "RAJ": 40, "MQ": 10},
+    "Select Sbt": {"Select Sbt": 70, "SBT": 30},
+}
+RATIO_TOLERANCE = 1.0  # +/- percentage points
 TZ = ZoneInfo("Asia/Kolkata")
 MIN_TEMPERING_HOURS = 10  # milling shouldn't normally start before this many hours
 SECONDS_IN_READING = 30   # the rotameter check window
@@ -147,6 +157,38 @@ def to_table(rows: list[dict]) -> pd.DataFrame:
     return pd.DataFrame(out)[list(DISPLAY_COLUMNS)].rename(columns=DISPLAY_COLUMNS)
 
 
+def fetch_recent_blend_checks(n_rows: int = 50) -> list[dict]:
+    return (
+        get_client().table(BLEND_RATIO_TABLE).select("*")
+        .order("id", desc=True).limit(n_rows).execute().data
+    )
+
+
+def render_blend_ratio_history(rows: list[dict], max_batches: int = 5):
+    """Each save creates several rows (one per variety) sharing the same
+    checked_at timestamp — group them back into one table per check."""
+    if not rows:
+        st.info("No blend ratio checks logged yet.")
+        return
+    df = pd.DataFrame(rows)
+    shown = 0
+    for (checked_at, blend_name), group in df.groupby(["checked_at", "blend"], sort=False):
+        if shown >= max_batches:
+            break
+        shown += 1
+        total = group["load_per_hour"].sum()
+        group = group.copy()
+        group["Ratio %"] = (group["load_per_hour"] / total * 100).round(1) if total > 0 else 0
+        st.markdown(f"**{blend_name} — {fmt_ts(checked_at)}**")
+        display = group[["variety", "vfd_frequency", "load_30s", "load_per_hour", "Ratio %"]].rename(columns={
+            "variety": "Variety",
+            "vfd_frequency": "VFD frequency",
+            "load_30s": "Load per 30 secs",
+            "load_per_hour": "Load per hour",
+        })
+        st.dataframe(display, hide_index=True, use_container_width=True)
+
+
 def checks_to_table(rows: list[dict]) -> pd.DataFrame:
     out = []
     for r in rows:
@@ -161,6 +203,114 @@ def checks_to_table(rows: list[dict]) -> pd.DataFrame:
     return pd.DataFrame(out)[list(CHECK_DISPLAY_COLUMNS)].rename(columns=CHECK_DISPLAY_COLUMNS)
 
 
+if "page" not in st.session_state:
+    st.session_state["page"] = "home"
+
+
+def go_to(page_name: str):
+    st.session_state["page"] = page_name
+
+
+if st.session_state["page"] == "home":
+    st.title("Mill floor logs")
+    st.write("Choose what you'd like to open.")
+    col_a, col_b = st.columns(2)
+    col_a.button(
+        "Tempering & Milling Log", on_click=go_to, args=("tempering",),
+        type="primary", use_container_width=True
+    )
+    col_b.button(
+        "Blend Ratio Check", on_click=go_to, args=("blend_ratio",),
+        type="primary", use_container_width=True
+    )
+    st.stop()
+
+if st.session_state["page"] == "blend_ratio":
+    st.button("← Back to menu", on_click=go_to, args=("home",))
+    st.title("Blend ratio check")
+    st.caption(
+        "Record a 30-second load reading for each variety, then see each "
+        "variety's share of the total hourly load."
+    )
+
+    blend_choice = st.selectbox("Blend", ["Select", "MP", "Select Sbt"])
+
+    if blend_choice != "Select":
+        varieties = BLEND_VARIETIES[blend_choice]
+        with st.form("blend_ratio_entry", clear_on_submit=True):
+            readings = {}
+            for v in varieties:
+                st.markdown(f"**{v}**")
+                c1, c2 = st.columns(2)
+                freq = c1.number_input(
+                    "VFD frequency", min_value=0.0, step=0.1, format="%.1f", key=f"vfd_{blend_choice}_{v}"
+                )
+                load = c2.number_input(
+                    "Load per 30 secs", min_value=0.0, step=0.1, format="%.2f", key=f"load_{blend_choice}_{v}"
+                )
+                readings[v] = (freq, load)
+            submitted_blend = st.form_submit_button(
+                "Save & calculate ratio", type="primary", use_container_width=True
+            )
+
+        if submitted_blend:
+            checked_at = datetime.now(TZ).isoformat()
+            computed = []
+            total_lph = 0.0
+            for v, (freq, load) in readings.items():
+                lph = load * (3600 / SECONDS_IN_READING)
+                total_lph += lph
+                computed.append({"variety": v, "vfd_frequency": freq, "load_30s": load, "load_per_hour": lph})
+
+            try:
+                rows_to_insert = [
+                    {**c, "checked_at": checked_at, "blend": blend_choice} for c in computed
+                ]
+                get_client().table(BLEND_RATIO_TABLE).insert(rows_to_insert).execute()
+                st.success("Saved.")
+
+                st.subheader("Ratio result")
+                targets = TARGET_RATIOS.get(blend_choice, {})
+                result_rows = []
+                out_of_range = []
+                for c in computed:
+                    pct = round((c["load_per_hour"] / total_lph * 100) if total_lph > 0 else 0, 1)
+                    result_rows.append({"Variety": c["variety"], "Ratio %": pct})
+                    target = targets.get(c["variety"])
+                    if target is not None and abs(pct - target) > RATIO_TOLERANCE:
+                        out_of_range.append((c["variety"], pct, target))
+
+                result_df = pd.DataFrame(result_rows)
+
+                def highlight_out_of_range(row):
+                    target = targets.get(row["Variety"])
+                    if target is not None and abs(row["Ratio %"] - target) > RATIO_TOLERANCE:
+                        return ["", "color: red; font-weight: bold;"]
+                    return ["", ""]
+
+                st.dataframe(
+                    result_df.style.apply(highlight_out_of_range, axis=1),
+                    hide_index=True, use_container_width=True,
+                )
+
+                for variety, pct, target in out_of_range:
+                    st.warning(
+                        f"**{variety}** ratio is **{pct}%**, outside the target "
+                        f"{target}% ± {RATIO_TOLERANCE}%."
+                    )
+            except Exception as exc:
+                st.error(f"Not saved: {exc}")
+
+    st.subheader("Recent checks")
+    try:
+        render_blend_ratio_history(fetch_recent_blend_checks())
+    except Exception as exc:
+        st.error(f"Could not load recent checks: {exc}")
+
+    st.stop()
+
+# --------------------------------------------------- Tempering & Milling Log
+st.button("← Back to menu", on_click=go_to, args=("home",))
 st.title("Tempering & milling log")
 
 tab_temper, tab_mill, tab_rota = st.tabs(
