@@ -490,7 +490,6 @@ except Exception as exc:
     st.error(f"Could not load entries: {exc}")
 
 st.subheader("Backup")
-st.caption("The free Supabase plan has no automatic backups. Download a copy regularly.")
 if st.button("Prepare CSV of all entries"):
     try:
         all_rows = fetch_all()
