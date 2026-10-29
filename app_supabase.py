@@ -299,18 +299,14 @@ if st.session_state["page"] == "granulation":
 
                 st.subheader("Granulation result")
                 result_df = pd.DataFrame([
-                    {
-                        "Sieve": label,
-                        "Retained %": values[key],
-                        "Target": gran_limit_text(key),
-                    }
+                    {"Sieve": label, "Retained %": values[key]}
                     for key, label, *_ in GRAN_SIEVES
                 ])
                 label_to_key = {label: key for key, label, *_ in GRAN_SIEVES}
 
                 def highlight_gran(row):
                     bad = gran_out_of_limits(label_to_key[row["Sieve"]], row["Retained %"])
-                    return ["", "color: red; font-weight: bold;" if bad else "", ""]
+                    return ["", "color: red; font-weight: bold;" if bad else ""]
 
                 st.dataframe(
                     result_df.style.apply(highlight_gran, axis=1),
@@ -319,8 +315,8 @@ if st.session_state["page"] == "granulation":
                 for key, label, *_ in GRAN_SIEVES:
                     if gran_out_of_limits(key, values[key]):
                         st.warning(
-                            f"**{label}** is **{values[key]:g}%**, outside the target "
-                            f"({gran_limit_text(key)})."
+                            f"**{label}** is **{values[key]:g}%**, which is outside the "
+                            "acceptable range."
                         )
             except Exception as exc:
                 st.error(f"Not saved: {exc}")
