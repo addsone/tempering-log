@@ -96,14 +96,29 @@ def get_client():
 
 
 def datetime_input(label: str, key: str) -> datetime:
-    """Date and time pickers side by side, returned as one timezone-aware datetime.
-    If session_state already holds a value for this key (e.g. pre-filled from a
-    Shift selection), that value wins over the 'now' default."""
+    """Date picker plus a 12-hour time picker (Hour 1-12, Min, AM/PM), returned
+    as one timezone-aware datetime. Everything the operator sees and enters is
+    in 12-hour time; the 24-hour conversion happens here, behind the scenes.
+
+    Defaults ('right now') are placed in session_state before the widgets are
+    drawn, and only when the key isn't already there. The widgets are created
+    without value=/index= arguments, so Streamlit doesn't complain about a
+    widget having both a default and a session_state value."""
     now = datetime.now(TZ).replace(second=0, microsecond=0)
-    col_date, col_time = st.columns(2)
-    d = col_date.date_input(f"{label} (date)", value=now.date(), key=f"{key}_d", format="DD/MM/YYYY")
-    t = col_time.time_input(f"{label} (time)", value=now.time(), key=f"{key}_t", step=60)
-    return datetime.combine(d, t, tzinfo=TZ)
+    st.session_state.setdefault(f"{key}_d", now.date())
+    st.session_state.setdefault(f"{key}_h12", now.hour % 12 or 12)
+    st.session_state.setdefault(f"{key}_min", now.minute)
+    st.session_state.setdefault(f"{key}_ampm", "AM" if now.hour < 12 else "PM")
+
+    st.markdown(f"**{label}**")
+    col_date, col_hour, col_min, col_ampm = st.columns([2, 1, 1, 1])
+    d = col_date.date_input("Date", key=f"{key}_d", format="DD/MM/YYYY")
+    hour12 = col_hour.selectbox("Hour", list(range(1, 13)), key=f"{key}_h12")
+    minute = col_min.number_input("Min", min_value=0, max_value=59, step=1, key=f"{key}_min")
+    ampm = col_ampm.selectbox("AM/PM", ["AM", "PM"], key=f"{key}_ampm")
+
+    hour24 = (hour12 % 12) + (12 if ampm == "PM" else 0)
+    return datetime.combine(d, dtime(hour24, int(minute)), tzinfo=TZ)
 
 
 def apply_shift_defaults(shift: str):
@@ -116,9 +131,13 @@ def apply_shift_defaults(shift: str):
         start_t, start_off, end_t, end_off = SHIFT_WINDOWS[shift]
         today = datetime.now(TZ).date()
         st.session_state["ts_d"] = today + timedelta(days=start_off)
-        st.session_state["ts_t"] = start_t
+        st.session_state["ts_h12"] = start_t.hour % 12 or 12
+        st.session_state["ts_min"] = start_t.minute
+        st.session_state["ts_ampm"] = "AM" if start_t.hour < 12 else "PM"
         st.session_state["te_d"] = today + timedelta(days=end_off)
-        st.session_state["te_t"] = end_t
+        st.session_state["te_h12"] = end_t.hour % 12 or 12
+        st.session_state["te_min"] = end_t.minute
+        st.session_state["te_ampm"] = "AM" if end_t.hour < 12 else "PM"
 
 
 def fmt_duration(minutes) -> str:
