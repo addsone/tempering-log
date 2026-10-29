@@ -17,6 +17,37 @@ TARGET_RATIOS = {
     "Select Sbt": {"Select Sbt": 70, "SBT": 30},
 }
 RATIO_TOLERANCE = 1.0  # +/- percentage points
+
+GRAN_TABLE = "granulation_checks"
+# (column key, label shown to the operator, lower limit, upper limit, upper limit inclusive?)
+GRAN_SIEVES = [
+    ("ret_425", "425 micron", None, 1.0, False),   # must be below 1%
+    ("ret_315", "315 micron", 0.4, 1.5, True),
+    ("ret_212", "212 micron", 4.0, 8.0, True),
+    ("ret_150", "150 micron", 12.0, 16.0, True),
+    ("ret_118", "118 micron", 9.0, 12.0, True),
+    ("throughs", "Throughs (below 118 micron)", 67.0, 71.0, True),
+]
+GRAN_LIMITS = {k: (lo, hi, inc) for k, _, lo, hi, inc in GRAN_SIEVES}
+GRAN_LABELS = {k: label for k, label, *_ in GRAN_SIEVES}
+
+
+def gran_out_of_limits(key: str, value) -> bool:
+    lo, hi, inclusive = GRAN_LIMITS[key]
+    if value is None:
+        return False
+    if lo is not None and value < lo:
+        return True
+    if hi is not None and (value > hi if inclusive else value >= hi):
+        return True
+    return False
+
+
+def gran_limit_text(key: str) -> str:
+    lo, hi, inclusive = GRAN_LIMITS[key]
+    if lo is None:
+        return f"below {hi:g}%"
+    return f"{lo:g} – {hi:g}%"
 TZ = ZoneInfo("Asia/Kolkata")
 MIN_TEMPERING_HOURS = 10  # milling shouldn't normally start before this many hours
 SECONDS_IN_READING = 30   # the rotameter check window
@@ -214,7 +245,7 @@ def go_to(page_name: str):
 if st.session_state["page"] == "home":
     st.title("Mill floor logs")
     st.write("Choose what you'd like to open.")
-    col_a, col_b = st.columns(2)
+    col_a, col_b, col_c = st.columns(3)
     col_a.button(
         "Tempering & Milling Log", on_click=go_to, args=("tempering",),
         type="primary", use_container_width=True
@@ -223,6 +254,108 @@ if st.session_state["page"] == "home":
         "Blend Ratio Check", on_click=go_to, args=("blend_ratio",),
         type="primary", use_container_width=True
     )
+    col_c.button(
+        "Granulation Check", on_click=go_to, args=("granulation",),
+        type="primary", use_container_width=True
+    )
+    st.stop()
+
+if st.session_state["page"] == "granulation":
+    st.button("← Back to menu", on_click=go_to, args=("home",))
+    st.title("Granulation check")
+    st.caption(
+        "Enter the % of flour retained on each sieve. Throughs (whatever passes "
+        "the 118 micron sieve) are calculated automatically so the total is 100%. "
+        "The time of entry is recorded automatically."
+    )
+
+    sieve_inputs = [s for s in GRAN_SIEVES if s[0] != "throughs"]
+    with st.form("granulation_entry", clear_on_submit=True):
+        entered = {}
+        for key, label, *_ in sieve_inputs:
+            entered[key] = st.number_input(
+                f"{label} — retained %", min_value=0.0, max_value=100.0,
+                step=0.1, format="%.2f", key=f"gran_{key}"
+            )
+        submitted_gran = st.form_submit_button(
+            "Save granulation check", type="primary", use_container_width=True
+        )
+
+    if submitted_gran:
+        throughs = round(100 - sum(entered.values()), 2)
+        if throughs < 0:
+            st.error(
+                f"The five sieve values add up to {sum(entered.values()):.2f}%, "
+                "which is more than 100%. Please re-check the readings."
+            )
+        else:
+            values = {**entered, "throughs": throughs}
+            checked_at = datetime.now(TZ)
+            try:
+                get_client().table(GRAN_TABLE).insert(
+                    {**values, "checked_at": checked_at.isoformat()}
+                ).execute()
+                st.success(f"Saved at {checked_at.strftime('%d-%b-%Y %H:%M')}.")
+
+                st.subheader("Granulation result")
+                result_df = pd.DataFrame([
+                    {
+                        "Sieve": label,
+                        "Retained %": values[key],
+                        "Target": gran_limit_text(key),
+                    }
+                    for key, label, *_ in GRAN_SIEVES
+                ])
+                label_to_key = {label: key for key, label, *_ in GRAN_SIEVES}
+
+                def highlight_gran(row):
+                    bad = gran_out_of_limits(label_to_key[row["Sieve"]], row["Retained %"])
+                    return ["", "color: red; font-weight: bold;" if bad else "", ""]
+
+                st.dataframe(
+                    result_df.style.apply(highlight_gran, axis=1),
+                    hide_index=True, use_container_width=True,
+                )
+                for key, label, *_ in GRAN_SIEVES:
+                    if gran_out_of_limits(key, values[key]):
+                        st.warning(
+                            f"**{label}** is **{values[key]:g}%**, outside the target "
+                            f"({gran_limit_text(key)})."
+                        )
+            except Exception as exc:
+                st.error(f"Not saved: {exc}")
+
+    st.subheader("Recent granulation checks")
+    try:
+        recent = (
+            get_client().table(GRAN_TABLE).select("*")
+            .order("id", desc=True).limit(10).execute().data
+        )
+        if recent:
+            hist = pd.DataFrame([
+                {"Checked at": fmt_ts(r["checked_at"]),
+                 **{GRAN_LABELS[k]: r[k] for k, *_ in GRAN_SIEVES}}
+                for r in recent
+            ])
+            name_to_key = {GRAN_LABELS[k]: k for k, *_ in GRAN_SIEVES}
+
+            def highlight_hist(row):
+                return [
+                    "color: red; font-weight: bold;"
+                    if col in name_to_key and gran_out_of_limits(name_to_key[col], row[col])
+                    else ""
+                    for col in row.index
+                ]
+
+            st.dataframe(
+                hist.style.apply(highlight_hist, axis=1),
+                hide_index=True, use_container_width=True,
+            )
+        else:
+            st.info("No granulation checks logged yet.")
+    except Exception as exc:
+        st.error(f"Could not load recent checks: {exc}")
+
     st.stop()
 
 if st.session_state["page"] == "blend_ratio":
@@ -490,6 +623,7 @@ except Exception as exc:
     st.error(f"Could not load entries: {exc}")
 
 st.subheader("Backup")
+st.caption("The free Supabase plan has no automatic backups. Download a copy regularly.")
 if st.button("Prepare CSV of all entries"):
     try:
         all_rows = fetch_all()
